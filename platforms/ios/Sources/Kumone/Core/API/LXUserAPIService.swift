@@ -557,12 +557,15 @@ final class LXUserAPIService: ObservableObject {
                 var requested = supported.isEmpty
                     ? Self.normalizedQuality(Self.requestedToken(for: quality))
                     : Self.lxQuality(for: quality, supported: supported)
-                // Only NetEase's protocol table lists the top tiers; other platforms stop at Hi-Res there. A
-                // script may still serve more, so ask for the tier the user chose anyway (own platform, first
-                // pass); if it refuses, the step-down pass falls back to what the source declares.
+                // A script may still serve more than it declares, so ask for the tier the
+                // user chose anyway (own platform, first pass); if it refuses, the step-down
+                // pass falls back to what the source declares.
                 let wanted = Self.normalizedQuality(Self.requestedToken(for: quality))
-                if platform != "wy", !supported.isEmpty, songTiers == nil,
+                if !supported.isEmpty, songTiers == nil,
                    Self.qualityRank(wanted) > Self.qualityRank(requested) {
+                    // Every platform, wy included: a source that under-declares its tiers
+                    // still gets asked for the tier the user chose. If it refuses, the
+                    // step-down pass falls back to what the source declares.
                     requested = wanted
                 }
                 candidates.append(MusicURLCandidate(
@@ -1493,7 +1496,10 @@ final class LXUserAPIService: ObservableObject {
         declared: [String]
     ) async -> Set<String> {
         guard await activate(source, waitTime: Self.qualityProbeTimeout) else { return [] }
-        let all = declared.isEmpty ? ["128k"] : declared
+        // A source that does not declare `qualitys` is unknown, not 128k-only: probe the
+        // base ladder (the same one playback walks down) so the picker can offer the
+        // higher tiers the source really serves instead of locking the song to 128k.
+        let all = declared.isEmpty ? ["128k", "320k", "flac", "flac24bit"] : declared
         let startedAt = Date()
         let premiumFloor = Self.qualityRank("flac")
         let premium = all.filter { Self.qualityRank($0) >= premiumFloor }
@@ -1589,9 +1595,16 @@ final class LXUserAPIService: ObservableObject {
         let declared = qualityCapabilities[platform, default: []]
             .map { Self.normalizedQuality($0) }
             .filter { order.contains($0) }
-        let sourceNames = declared.isEmpty ? ["128k"] : order.filter(declared.contains)
         let concrete = Self.qualityNames(for: track)
 
+        if declared.isEmpty {
+            // The source declared nothing: the catalogue's own file table is the only
+            // per-song evidence. An empty result stays empty (unknown) so callers probe
+            // the real tiers instead of pretending the song is 128k-only.
+            return order.filter(concrete.contains)
+        }
+
+        let sourceNames = order.filter(declared.contains)
         if !concrete.isEmpty {
             return order.filter { sourceNames.contains($0) && concrete.contains($0) }
         }

@@ -412,7 +412,11 @@ final class PlayerService: ObservableObject {
                 && ($0.lxType == servedNow || (!refuted.contains($0.lxType) && allowed.contains($0.lxType)))
                 && seenTypes.insert($0.lxType).inserted
         }
-        let result = available.isEmpty ? [.standard] : available
+        // Nothing probed (source still waking up / probe timed out): offer the base
+        // tiers instead of locking the picker to 128k. Selecting a tier the source
+        // cannot serve is safe - playback walks down the ladder and the label shows
+        // the quality actually measured from the served file.
+        let result = available.isEmpty ? [.standard, .exhigh, .lossless, .hires] : available
         // Do not cache a timeout/empty-source fallback as if it were a real
         // capability result; the source may finish initializing moments later.
         // A cold source often answers only some tiers: never cache a thin result as the final answer.
