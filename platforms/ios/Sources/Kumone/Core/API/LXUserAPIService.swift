@@ -98,7 +98,7 @@ final class LXUserAPIService: ObservableObject {
         let sourceName = LXSourceStore.shared.sources.first { $0.id == loadedID }?.name ?? "音源"
         DiagnosticLogStore.shared.append(level: .info, category: "音源能力",
                                          message: "\(sourceName) 声明支持：\(readable.joined(separator: "、"))",
-                                         detail: "已启用音源合计：\(AudioQuality.allCases.filter { sourceTierSupport.contains($0.lxType) }.map(\.displayName).joined(separator: "、"))。不被任何已启用音源声明的音质不会在列表中显示。")
+                                         detail: "已启用音源合计：\(AudioQuality.allCases.filter { sourceTierSupport.contains($0.lxType) }.map(\.displayName).joined(separator: "、"))。音质列表以对音源的实际探测为准，未声明的档位也会直接请求。")
         QualitySupport.normalizeSelection()
     }
 
@@ -552,19 +552,13 @@ final class LXUserAPIService: ObservableObject {
                     let table = songTiers.map { "平台文件表：" + Self.qualityOrder.filter($0.contains).joined(separator: "、") } ?? "平台文件表读取失败"
                     DiagnosticLogStore.shared.append(level: .info, category: "音质表", message: "\(platform) 《\(requestTrack.name)》", detail: table)
                 }
-                // Capabilities not known yet (source still loading, quality list not refreshed): ask for the
-                // tier the user chose instead of silently falling back to 128k.
-                var requested = supported.isEmpty
-                    ? Self.normalizedQuality(Self.requestedToken(for: quality))
-                    : Self.lxQuality(for: quality, supported: supported)
-                // Only NetEase's protocol table lists the top tiers; other platforms stop at Hi-Res there. A
-                // script may still serve more, so ask for the tier the user chose anyway (own platform, first
-                // pass); if it refuses, the step-down pass falls back to what the source declares.
+                // 直接调用 LX（落雪）自定义音源：发给音源 musicUrl 的 type 始终是
+                // 用户选择的档位。音源 init 声明的 qualitys 和平台文件表只作提示与
+                // 回退参考，不再压低请求档位——很多落雪音源只声明 128k/320k，直接
+                // 请求 flac / flac24bit / master 时仍能返回无损文件；音源给不了时，
+                // 下面的逐级回退轮会自动降档重试。
                 let wanted = Self.normalizedQuality(Self.requestedToken(for: quality))
-                if platform != "wy", !supported.isEmpty, songTiers == nil,
-                   Self.qualityRank(wanted) > Self.qualityRank(requested) {
-                    requested = wanted
-                }
+                let requested = wanted
                 candidates.append(MusicURLCandidate(
                     source: source,
                     sourcePriority: sourcePriority,
@@ -599,17 +593,18 @@ final class LXUserAPIService: ObservableObject {
             // The requested tier first, then every lower tier this source declares, best first: when the
             // song lacks the requested tier the source is asked for the next best one instead of giving up.
             var lowerTiers: [String] = []
-            let ladder = candidate.supportedQualities.isEmpty
-                ? ["flac24bit", "flac", "320k", "128k"]
-                : candidate.supportedQualities
+            // 回退阶梯使用完整的规范档位表：音源未声明的档位也可能真的能提供，
+            // 从所选档位往下逐级请求，直到音源返回一个可用文件为止。
+            let ladder = Self.qualityOrder
             for tier in ladder.map(Self.normalizedQuality) {
                 let rank = Self.qualityRank(tier)
                 if rank >= 0, rank < askedRank, !lowerTiers.contains(tier) { lowerTiers.append(tier) }
             }
             lowerTiers.sort { Self.qualityRank($0) > Self.qualityRank($1) }
+            // 音源真正声明过的档位（仅用于超时与去重参考，不再限制请求档位）。
+            let declaredTiers = Set(candidate.supportedQualities.map(Self.normalizedQuality))
             // The step-down pass does not repeat an undeclared tier that pass 0 already asked for.
-            let declaredLadder = ladder.map(Self.normalizedQuality)
-            let firstTier = passIndex == 2 && !declaredLadder.contains(candidate.requestedQuality) ? [] : [candidate.requestedQuality]
+            let firstTier = passIndex == 2 && !declaredTiers.contains(candidate.requestedQuality) ? [] : [candidate.requestedQuality]
             var lastTierError: String?
             for tier in firstTier + (passIndex == 2 ? lowerTiers : []) {
                 if passIndex == 1, let began = crossStartedAt, Date().timeIntervalSince(began) > crossPlatformDeadline { break }
@@ -622,13 +617,12 @@ final class LXUserAPIService: ObservableObject {
                             "musicInfo": musicInfo(
                                 for: candidate.track,
                                 platform: candidate.platform,
-                                qualities: candidate.supportedQualities.isEmpty
-                                    ? ["128k", "320k", "flac", "flac24bit"] : candidate.supportedQualities
+                                qualities: Self.qualityOrder
                             )
                         ],
                         // A tier the source never declared is only a try (3 s); a Hi-Res or better request gets 5 s, because a source
                         // that hangs on the top tier must not hold playback for the full 20 s before the step-down.
-                        timeout: (!candidate.supportedQualities.isEmpty && !declaredLadder.contains(Self.normalizedQuality(tier))) ? 3 : (Self.qualityRank(tier) >= 3 ? 5 : 20)
+                        timeout: (!declaredTiers.isEmpty && !declaredTiers.contains(Self.normalizedQuality(tier))) ? 3 : (Self.qualityRank(tier) >= 3 ? 5 : 20)
                     )
                     guard let data = response["data"] as? [String: Any],
                           let rawURL = data["url"] as? String,
@@ -650,7 +644,7 @@ final class LXUserAPIService: ObservableObject {
                     let actualQuality = Self.resolvedQuality(
                         data: data,
                         requested: tier,
-                        available: candidate.supportedQualities.isEmpty ? [tier] : candidate.supportedQualities
+                        available: Self.qualityOrder
                     )
                     DiagnosticLogStore.shared.append(level: .info, category: "音源请求", message: "\(candidate.platform) 请求 \(tier) → 返回 \(actualQuality)", detail: "音源：\(candidate.source.name)　轮次：\(passIndex)　返回字段 type=\((data["type"] as? String) ?? "-")")
                     // The same song can come back as Atmos on one request and as FLAC on the next (the source
@@ -669,8 +663,7 @@ final class LXUserAPIService: ObservableObject {
                                     "musicInfo": musicInfo(
                                         for: candidate.track,
                                         platform: candidate.platform,
-                                        qualities: candidate.supportedQualities.isEmpty
-                                            ? ["128k", "320k", "flac", "flac24bit"] : candidate.supportedQualities
+                                        qualities: Self.qualityOrder
                                     )
                                 ]
                             ),
@@ -684,7 +677,7 @@ final class LXUserAPIService: ObservableObject {
                             let againQuality = Self.resolvedQuality(
                                 data: againData,
                                 requested: tier,
-                                available: candidate.supportedQualities.isEmpty ? [tier] : candidate.supportedQualities
+                                available: Self.qualityOrder
                             )
                             if againQuality != "unknown",
                                Self.qualityRank(againQuality) > Self.qualityRank(bestQuality) {
@@ -1319,8 +1312,9 @@ final class LXUserAPIService: ObservableObject {
         let primaryPlatform = canonicalPlatform(track.source ?? track.sourceMetadata["source"]) ?? "wy"
         var available = Set<String>()
         if let songTiers = await PlatformQualityInfo.shared.tiers(for: track) {
-            // The platform's own file table is exact: no per-song probing needed.
-            return Self.qualityOrder.reversed().filter(songTiers.contains)
+            // 平台文件表说明这首歌存在哪些档位的文件，但落雪音源仍可能提供更高
+            // 档位，所以只并入结果、不再提前返回，继续向音源逐档探测。
+            available.formUnion(songTiers)
         }
         if SettingsManager.shared.playbackSourceMode != .thirdParty {
             if primaryPlatform == "wy", NeteaseClient.shared.isLoggedIn {
@@ -1493,7 +1487,10 @@ final class LXUserAPIService: ObservableObject {
         declared: [String]
     ) async -> Set<String> {
         guard await activate(source, waitTime: Self.qualityProbeTimeout) else { return [] }
-        let all = declared.isEmpty ? ["128k"] : declared
+        // 直接向 LX 音源逐档探测，不局限于音源 init 声明的 qualitys：很多落雪
+        // 音源只声明 128k/320k，但请求更高档位时仍能返回无损文件。探测结果以
+        // 实际返回的 URL 与文件实测为准。
+        let all = Self.qualityOrder
         let startedAt = Date()
         let premiumFloor = Self.qualityRank("flac")
         let premium = all.filter { Self.qualityRank($0) >= premiumFloor }
